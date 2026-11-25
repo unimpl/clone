@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -36,9 +37,14 @@ type watchArchive struct {
 	endpoint string
 	excluded map[string]bool
 	groups   map[string]bool
-	source   atomic.Value
+	identity atomic.Value
 	cancel   context.CancelFunc
 	done     chan struct{}
+}
+
+type archiveIdentity struct {
+	source       string
+	legacySource string
 }
 
 func loadOpenVikingConfig(dir string) (openVikingConfig, map[string]bool, error) {
@@ -137,17 +143,17 @@ func (archive *watchArchive) includes(c chat) bool {
 	return !archive.excluded[c.id] && (c.mode == "p2p" || archive.groups[c.id])
 }
 
-func stableFeishuID(prefix, value string) string {
+func archiveDigest(value string) string {
 	digest := sha256.Sum256([]byte(value))
-	return prefix + hex.EncodeToString(digest[:16])
+	return hex.EncodeToString(digest[:16])
 }
 
 func (archive *watchArchive) setIdentity(identity watchIdentity) {
-	source := archive.appID + "\x00" + identity.OpenID
+	legacyKey := archive.appID + "\x00" + identity.OpenID
 	if archive.endpoint != "" && archive.endpoint != defaultOpenVikingEndpoint {
-		source += "\x00" + archive.endpoint
+		legacyKey += "\x00" + archive.endpoint
 	}
-	archive.source.Store(stableFeishuID("", source))
+	archive.identity.Store(archiveIdentity{source: identity.OpenID, legacySource: archiveDigest(legacyKey)})
 }
 
 func (archive *watchArchive) close() {
@@ -165,9 +171,9 @@ func (archive *watchArchive) upload(ctx context.Context) {
 	sessions := make(map[string]bool)
 	var lastError string
 	for ctx.Err() == nil {
-		source, _ := archive.source.Load().(string)
-		if source != "" {
-			item, err := archive.nextDelivery(ctx, source)
+		identity, _ := archive.identity.Load().(archiveIdentity)
+		if identity.source != "" {
+			item, err := archive.nextDelivery(ctx, identity)
 			if err == nil && item != nil {
 				err = archive.deliver(ctx, item, sessions)
 				if err == nil {
@@ -191,18 +197,34 @@ func (archive *watchArchive) upload(ctx context.Context) {
 func (archive *watchArchive) deliver(ctx context.Context, item *archiveDelivery, sessions map[string]bool) error {
 	sessionID := item.sessionID()
 	if item.state == "sending" {
-		result, err := archive.client.GetSessionContext(ctx, sessionID, 0)
-		if err == nil && hasArchiveMessage(result, item.messageID) {
+		found, err := archive.confirmDelivery(ctx, sessionID, item.messageID)
+		if found {
 			return archive.updateDelivery(ctx, item, "sent", 0)
 		}
 		return archive.deferDelivery(ctx, item, "sending", "写入结果待核对", err)
 	}
 
 	if !sessions[sessionID] {
+		autoCommit := map[string]any{
+			"message_count_threshold": 30,
+			"pending_token_threshold": 8000,
+			"idle_timeout_seconds":    3600,
+			"keep_recent_count":       0,
+		}
 		_, err := archive.client.CreateSession(ctx, &openviking.CreateSessionOptions{
-			SessionID: sessionID, DisableAutoCommit: true,
+			SessionID:        sessionID,
+			AutoCommitPolicy: autoCommit,
+			MemoryPolicy:     map[string]any{"peer": map[string]any{"enabled": true}},
 		})
-		if err != nil && !openviking.IsCode(err, "ALREADY_EXISTS") && openVikingStatus(err) != http.StatusConflict {
+		switch {
+		case openviking.IsCode(err, "ALREADY_EXISTS") || openVikingStatus(err) == http.StatusConflict:
+			_, err = archive.client.UpdateSessionConfig(ctx, sessionID, &openviking.UpdateSessionConfigOptions{
+				AutoCommitPolicy: &autoCommit,
+			})
+			if err != nil {
+				return archive.deferDelivery(ctx, item, "pending", "启用会话自动提交失败", err)
+			}
+		case err != nil:
 			return archive.deferDelivery(ctx, item, "pending", "创建会话失败", err)
 		}
 		sessions[sessionID] = true
@@ -229,6 +251,57 @@ func (archive *watchArchive) deliver(ctx context.Context, item *archiveDelivery,
 	}
 }
 
+func (archive *watchArchive) confirmDelivery(ctx context.Context, sessionID, messageID string) (bool, error) {
+	result, err := archive.client.GetSessionContext(ctx, sessionID, 0)
+	if err != nil {
+		return false, err
+	}
+	messages, _ := result["messages"].([]any)
+	for _, value := range messages {
+		message, _ := value.(map[string]any)
+		if hasArchiveMessage(message, messageID) {
+			return true, nil
+		}
+	}
+
+	// A commit can move the message out of the live context before we confirm the write.
+	history := "viking://~/sessions/" + sessionID + "/history"
+	options := &openviking.ListOptions{Simple: true, Limit: 100, SortBy: "name", SortOrder: "desc"}
+	for {
+		page, err := archive.client.ListPage(ctx, history, options)
+		if openviking.IsCode(err, "NOT_FOUND") || openVikingStatus(err) == http.StatusNotFound {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		for _, entry := range page.Result {
+			uri, _ := entry.(string)
+			uri = strings.TrimRight(uri, "/")
+			if !strings.HasPrefix(path.Base(uri), "archive_") {
+				continue
+			}
+			content, err := archive.client.Read(ctx, uri+"/messages.jsonl", 0, -1)
+			if openviking.IsCode(err, "NOT_FOUND") || openVikingStatus(err) == http.StatusNotFound {
+				continue
+			}
+			if err != nil {
+				return false, err
+			}
+			for line := range strings.SplitSeq(content, "\n") {
+				var message map[string]any
+				if json.Unmarshal([]byte(line), &message) == nil && hasArchiveMessage(message, messageID) {
+					return true, nil
+				}
+			}
+		}
+		if !page.HasMore || len(page.Result) == 0 {
+			return false, nil
+		}
+		options.Offset += len(page.Result)
+	}
+}
+
 func (archive *watchArchive) deferDelivery(ctx context.Context, item *archiveDelivery, state, reason string, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -249,19 +322,15 @@ func openVikingStatus(err error) int {
 	return 0
 }
 
-func hasArchiveMessage(result map[string]any, id string) bool {
-	messages, _ := result["messages"].([]any)
-	for _, value := range messages {
-		message, _ := value.(map[string]any)
-		if sourceID, ok := message["content"].(string); ok && isArchiveMessage(sourceID, id) {
+func hasArchiveMessage(message map[string]any, id string) bool {
+	if content, ok := message["content"].(string); ok && isArchiveMessage(content, id) {
+		return true
+	}
+	parts, _ := message["parts"].([]any)
+	for _, value := range parts {
+		part, _ := value.(map[string]any)
+		if content, ok := part["text"].(string); ok && isArchiveMessage(content, id) {
 			return true
-		}
-		parts, _ := message["parts"].([]any)
-		for _, value := range parts {
-			part, _ := value.(map[string]any)
-			if content, ok := part["text"].(string); ok && isArchiveMessage(content, id) {
-				return true
-			}
 		}
 	}
 	return false

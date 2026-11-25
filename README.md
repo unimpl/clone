@@ -45,9 +45,15 @@ bash ./run.sh watch --interval 15s
 
 已有的 `OPENVIKING_API_KEY` 和 `OPENVIKING_AGENT_ID` 环境变量会覆盖对应的 JSON 字段。没有 `openviking.json` 时，仍支持原有的环境变量和 `openviking-groups.txt` 配置。
 
-同一飞书账号下，每个 `chat_id` 对应一个固定的 OpenViking Session。话题根消息和回复归入所属会话，记录 `thread_id`、`root_id` 和 `parent_id`。消息保留原始正文和发送时间，图片以资源地址和原正文中的资源标识保存。程序关闭 Session 自动提交，只追加消息。
+同一飞书账号下，每个 `chat_id` 对应一个固定的 OpenViking Session。话题根消息和回复归入所属会话，记录 `thread_id`、`root_id` 和 `parent_id`。消息保留原始正文和发送时间，图片以资源地址和原正文中的资源标识保存。
 
-本地 `openviking.sqlite` 保存待上传消息和已采集会话的游标。后台上传失败会保留待处理记录，重启后继续处理。追加请求结果不明确时会查回 OpenViking 核对，有待核对消息的会话会等到确认后才继续上传。
+新归档记录的 `source` 使用登录用户的飞书 `open_id`，`peer_id` 使用发言者的原始 ID。新 Session ID 由 `source` 和 `chat_id` 组合，超过 64 个字符时用组合 ID 的摘要缩短。升级后沿用本地采集游标，旧队列里的消息继续投递到原 Session，新采集的消息进入新 Session。
+
+新建 Session 时启用 Peer 记忆抽取。未归档消息超过 30 条或 8,000 Token 时自动提交。开启服务端空闲调度的部署也会在 Session 空闲 1 小时后提交。已有 Session 在后台首次尝试追加消息时补设自动提交策略，Peer 抽取沿用该 Session 生效的记忆策略。
+
+旧 Session 如果还有待提交消息，可以用 `ov session get '<Session ID>'` 查看，然后用 `ov session commit '<Session ID>'` 按原有策略归档并提取记忆。记忆任务完成后可从归档的 `memory_diff.json` 查看结果。曾使用哈希 `peer_id` 的历史消息按当时保存的标识抽取。已归档的消息留在历史目录，后续提交只处理待归档消息。
+
+本地 `openviking.sqlite` 保存待上传消息和已采集会话的游标。后台上传失败会保留待处理记录，重启后继续处理。追加请求结果不明确时会在 OpenViking 的实时消息和历史归档中核对，有待核对消息的会话会等到确认后才继续上传。
 
 ## 应用配置
 

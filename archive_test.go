@@ -61,6 +61,17 @@ func TestArchiveWatchResumesAndKeepsRawTopicMessages(t *testing.T) {
 	if result := archive.poll(ctx, client, group, newState(started), started, until, time.Hour, emit); !result.complete {
 		t.Fatal("first poll failed")
 	}
+	var source string
+	if err := db.QueryRow(`SELECT source FROM archive_checkpoints WHERE chat_id = ?`, chatID).Scan(&source); err != nil || source != "ou_watcher" {
+		t.Fatalf("checkpoint source = %q, %v", source, err)
+	}
+	const legacySource = "77f605f0b48fa4fdd8b2207006a44869"
+	if _, err := db.Exec(`UPDATE archive_checkpoints SET source = ?`, legacySource); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE archive_messages SET source = ? WHERE message_id = 'om_root'`, legacySource); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -83,32 +94,57 @@ func TestArchiveWatchResumesAndKeepsRawTopicMessages(t *testing.T) {
 	if err := db.QueryRow(`SELECT count(*) FROM archive_messages`).Scan(&count); err != nil || count != 2 {
 		t.Fatalf("messages in queue = %d, %v", count, err)
 	}
+	identity, _ := archive.identity.Load().(archiveIdentity)
+	item, err := archive.nextDelivery(ctx, identity)
+	if err != nil || item == nil || item.sessionID() != "feishu_"+legacySource+"_"+chatID {
+		t.Fatalf("legacy delivery = %+v, %v", item, err)
+	}
 	var content string
-	if err := db.QueryRow(`SELECT content FROM archive_messages WHERE message_id = 'om_reply'`).Scan(&content); err != nil {
+	if err := db.QueryRow(`SELECT source, content FROM archive_messages WHERE message_id = 'om_reply'`).Scan(&source, &content); err != nil {
 		t.Fatal(err)
 	}
 	var record archiveMessage
 	if err := json.Unmarshal([]byte(content), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.ThreadID != "omt_alert" || record.RootID != "om_root" || record.ParentID != "om_root" ||
-		get(record.Body) != original || record.Sender != "小林" || record.PeerID == "" || len(record.ImageURLs) != 1 {
-		t.Fatalf("unexpected archived topic message: %+v", record)
+	if source != "ou_watcher" || record.ThreadID != "omt_alert" || record.RootID != "om_root" || record.ParentID != "om_root" ||
+		get(record.Body) != original || record.Sender != "小林" || record.PeerID != "ou_sender" || len(record.ImageURLs) != 1 {
+		t.Fatalf("unexpected archived topic message for source %q: %+v", source, record)
 	}
 }
 
 func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
+	t.Run("new session with live message", func(t *testing.T) {
+		testOpenVikingDelivery(t, false)
+	})
+	t.Run("existing session with committed message", func(t *testing.T) {
+		testOpenVikingDelivery(t, true)
+	})
+}
+
+func testOpenVikingDelivery(t *testing.T, existingSession bool) {
+	t.Helper()
 	ctx := context.Background()
 	db, err := openPrivateArchiveDB(filepath.Join(t.TempDir(), "openviking.sqlite"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	const source = "example_source"
-	const sessionPath = "/openviking/api/v1/sessions/feishu_example_source_oc_private"
+	identity := archiveIdentity{source: "ou_0123456789abcdef0123456789abcdef"}
+	const sessionID = "feishu_190b0b473d958180db7cc7ad171e9d0a"
+	const sessionPath = "/openviking/api/v1/sessions/" + sessionID
+	const archiveURI = "viking://user/default/sessions/" + sessionID + "/history/archive_001"
+	const senderID = "cli_a0d9fec6ffb8d00e"
 	var mu sync.Mutex
 	var added []string
-	var created int
+	var created, configured int
+	checkAutoCommit := func(body map[string]any) {
+		policy, _ := body["auto_commit_policy"].(map[string]any)
+		if policy["message_count_threshold"] != float64(30) || policy["pending_token_threshold"] != float64(8000) ||
+			policy["idle_timeout_seconds"] != float64(3600) || policy["keep_recent_count"] != float64(0) {
+			t.Errorf("incorrect auto-commit policy: %v", policy)
+		}
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -123,18 +159,35 @@ func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
-			autoCommit, present := body["auto_commit_policy"]
-			if body["session_id"] != "feishu_example_source_oc_private" || !present || autoCommit != nil {
+			checkAutoCommit(body)
+			memory, _ := body["memory_policy"].(map[string]any)
+			peer, _ := memory["peer"].(map[string]any)
+			if body["session_id"] != sessionID || peer["enabled"] != true {
 				t.Errorf("incorrect session parameters: %v", body)
 			}
-			w.Write([]byte(`{"status":"ok","result":{"session_id":"feishu_example_source_oc_private"}}`))
+			if existingSession {
+				w.WriteHeader(http.StatusConflict)
+				w.Write([]byte(`{"status":"error","error":{"code":"ALREADY_EXISTS"}}`))
+				return
+			}
+			w.Write([]byte(`{"status":"ok","result":{"session_id":"` + sessionID + `"}}`))
+		case req.Method == http.MethodPatch && req.URL.Path == sessionPath+"/config":
+			configured++
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			checkAutoCommit(body)
+			if _, present := body["memory_policy"]; present {
+				t.Errorf("unexpected memory policy in session patch: %v", body)
+			}
+			w.Write([]byte(`{"status":"ok","result":{}}`))
 		case req.Method == http.MethodPost && req.URL.Path == sessionPath+"/messages":
 			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 				t.Error(err)
 			}
 			content, _ := body["content"].(string)
 			added = append(added, content)
-			if body["role"] != "user" || body["peer_id"] != "feishu_peer_example" ||
+			if body["role"] != "user" || body["peer_id"] != senderID ||
 				body["created_at"] != "1970-01-01T00:01:52Z" {
 				t.Errorf("incorrect message parameters: %v", body)
 			}
@@ -145,9 +198,27 @@ func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
 			}
 			w.Write([]byte(`{"status":"ok","result":{"message_count":2}}`))
 		case req.Method == http.MethodGet && req.URL.Path == sessionPath+"/context":
+			if existingSession {
+				w.Write([]byte(`{"status":"ok","result":{"messages":[]}}`))
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]any{"status": "ok", "result": map[string]any{
 				"messages": []any{map[string]any{"parts": []any{map[string]any{"type": "text", "text": added[0]}}}},
 			}})
+		case existingSession && req.Method == http.MethodGet && req.URL.Path == "/openviking/api/v1/fs/ls":
+			if req.URL.Query().Get("uri") != "viking://~/sessions/"+sessionID+"/history" {
+				t.Errorf("incorrect history URI: %s", req.URL)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": "ok", "result": []string{archiveURI + "/"}})
+		case existingSession && req.Method == http.MethodGet && req.URL.Path == "/openviking/api/v1/content/read":
+			if req.URL.Query().Get("uri") != archiveURI+"/messages.jsonl" {
+				t.Errorf("incorrect archived message URI: %s", req.URL)
+			}
+			line, err := json.Marshal(map[string]any{"content": added[0]})
+			if err != nil {
+				t.Error(err)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": "ok", "result": string(line) + "\n"})
 		default:
 			t.Errorf("unexpected OpenViking request %s %s", req.Method, req.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -160,17 +231,17 @@ func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
 	}
 	defer client.CloseIdleConnections()
 	archive := &watchArchive{db: db, client: client}
-	dm := chat{id: "oc_private", mode: "p2p"}
+	dm := chat{id: "oc_abcdef0123456789abcdef0123456789", mode: "p2p"}
 	for _, id := range []string{"om_first", "om_second"} {
-		record := archiveMessage{MessageID: id, ChatID: dm.id, CreatedAt: time.Unix(112, 0), PeerID: "feishu_peer_example"}
-		if err := archive.saveCheckpoint(ctx, source, dm, archiveCheckpoint{}, map[string]archiveMessage{id: record}); err != nil {
+		record := archiveMessage{MessageID: id, ChatID: dm.id, CreatedAt: time.Unix(112, 0), PeerID: senderID}
+		if err := archive.saveCheckpoint(ctx, identity, dm, archiveCheckpoint{}, map[string]archiveMessage{id: record}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	sessions := make(map[string]bool)
 	deliverNext := func(wantID, wantState string) {
 		t.Helper()
-		item, err := archive.nextDelivery(ctx, source)
+		item, err := archive.nextDelivery(ctx, identity)
 		if err != nil || item == nil || item.messageID != wantID || item.state != wantState {
 			t.Fatalf("next delivery = %+v, %v", item, err)
 		}
@@ -179,7 +250,7 @@ func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
 		}
 	}
 	deliverNext("om_first", "pending")
-	if item, err := archive.nextDelivery(ctx, source); err != nil || item != nil {
+	if item, err := archive.nextDelivery(ctx, identity); err != nil || item != nil {
 		t.Fatalf("later message passed an unresolved append: %+v, %v", item, err)
 	}
 	if _, err := db.Exec(`UPDATE archive_messages SET retry_at=0 WHERE message_id='om_first'`); err != nil {
@@ -189,8 +260,12 @@ func TestOpenVikingDeliveryReconcilesAmbiguousAppend(t *testing.T) {
 	deliverNext("om_second", "pending")
 	mu.Lock()
 	defer mu.Unlock()
-	if created != 1 || len(added) != 2 || !isArchiveMessage(added[0], "om_first") ||
+	wantConfigured := 0
+	if existingSession {
+		wantConfigured = 1
+	}
+	if created != 1 || configured != wantConfigured || len(added) != 2 || !isArchiveMessage(added[0], "om_first") ||
 		!isArchiveMessage(added[1], "om_second") {
-		t.Fatalf("created sessions = %d, appended messages = %v", created, added)
+		t.Fatalf("created sessions = %d, patched sessions = %d, appended messages = %v", created, configured, added)
 	}
 }

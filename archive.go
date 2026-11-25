@@ -107,9 +107,7 @@ func makeArchiveMessage(c chat, m message, threadID string) archiveMessage {
 		record.SenderID = get(sender.Id)
 		record.SenderType = get(sender.SenderType)
 		record.Sender = get(sender.SenderName)
-		if record.SenderID != "" {
-			record.PeerID = stableFeishuID("feishu_peer_", get(sender.IdType)+"\x00"+record.SenderID)
-		}
+		record.PeerID = record.SenderID
 	}
 	return record
 }
@@ -190,9 +188,9 @@ func openPrivateArchiveDB(path string) (*sql.DB, error) {
 
 func (archive *watchArchive) poll(ctx context.Context, client *imClient, c chat, state *watchChat,
 	started, until time.Time, lookback time.Duration, emit func(message)) watchPollResult {
-	source, _ := archive.source.Load().(string)
+	identity, _ := archive.identity.Load().(archiveIdentity)
 	if state.archiveStarted.IsZero() {
-		if err := archive.restoreCheckpoint(ctx, source, c.id, state, started); err != nil {
+		if err := archive.restoreCheckpoint(ctx, identity, c.id, state, started); err != nil {
 			reportWatchError(ctx, c, "OpenViking 本地游标", "openviking", err, state.errors)
 			return watchPollResult{}
 		}
@@ -211,7 +209,7 @@ func (archive *watchArchive) poll(ctx context.Context, client *imClient, c chat,
 		}
 	})
 
-	err := archive.saveCheckpoint(ctx, source, c, state.archiveCheckpoint(), records)
+	err := archive.saveCheckpoint(ctx, identity, c, state.archiveCheckpoint(), records)
 	if err != nil {
 		state.restoreArchive(before)
 		maps.Copy(state.seen, seenBefore)
@@ -221,10 +219,10 @@ func (archive *watchArchive) poll(ctx context.Context, client *imClient, c chat,
 	return result
 }
 
-func (archive *watchArchive) restoreCheckpoint(ctx context.Context, source, chatID string, state *watchChat, started time.Time) error {
+func (archive *watchArchive) restoreCheckpoint(ctx context.Context, identity archiveIdentity, chatID string, state *watchChat, started time.Time) error {
 	var data []byte
-	err := archive.db.QueryRowContext(ctx, `SELECT data FROM archive_checkpoints WHERE source = ? AND chat_id = ?`,
-		source, chatID).Scan(&data)
+	err := archive.db.QueryRowContext(ctx, `SELECT data FROM archive_checkpoints WHERE source IN (?, ?) AND chat_id = ?
+		ORDER BY source = ? DESC LIMIT 1`, identity.source, identity.legacySource, chatID, identity.source).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
 		state.archiveStarted = started
 		return nil
@@ -240,7 +238,7 @@ func (archive *watchArchive) restoreCheckpoint(ctx context.Context, source, chat
 	return nil
 }
 
-func (archive *watchArchive) saveCheckpoint(ctx context.Context, source string, c chat, checkpoint archiveCheckpoint,
+func (archive *watchArchive) saveCheckpoint(ctx context.Context, identity archiveIdentity, c chat, checkpoint archiveCheckpoint,
 	records map[string]archiveMessage) error {
 	data, err := json.Marshal(checkpoint)
 	if err != nil {
@@ -258,14 +256,17 @@ func (archive *watchArchive) saveCheckpoint(ctx context.Context, source string, 
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO archive_messages
 			(source, message_id, chat_id, chat_mode, created_at, peer_id, content)
-			VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source, message_id) DO NOTHING`,
-			source, message.MessageID, c.id, c.mode, message.CreatedAt.UnixMilli(), message.PeerID, string(content))
+			SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
+				SELECT 1 FROM archive_messages WHERE source = ? AND message_id = ?
+			) ON CONFLICT(source, message_id) DO NOTHING`,
+			identity.source, message.MessageID, c.id, c.mode, message.CreatedAt.UnixMilli(), message.PeerID,
+			string(content), identity.legacySource, message.MessageID)
 		if err != nil {
 			return err
 		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO archive_checkpoints(source, chat_id, data) VALUES (?, ?, ?)
-		ON CONFLICT(source, chat_id) DO UPDATE SET data = excluded.data`, source, c.id, string(data))
+		ON CONFLICT(source, chat_id) DO UPDATE SET data = excluded.data`, identity.source, c.id, string(data))
 	if err != nil {
 		return err
 	}
@@ -280,30 +281,38 @@ type archiveDelivery struct {
 	peerID    string
 	content   string
 	state     string
+	legacy    bool
 }
 
 func (item archiveDelivery) sessionID() string {
-	return fmt.Sprintf("feishu_%s_%s", item.source, item.chatID)
+	id := fmt.Sprintf("feishu_%s_%s", item.source, item.chatID)
+	// Preserve the original destination for legacy deliveries, including ambiguous writes.
+	if !item.legacy && len(id) > 64 {
+		return "feishu_" + archiveDigest(id)
+	}
+	return id
 }
 
-func (archive *watchArchive) nextDelivery(ctx context.Context, source string) (*archiveDelivery, error) {
+func (archive *watchArchive) nextDelivery(ctx context.Context, identity archiveIdentity) (*archiveDelivery, error) {
 	rows, err := archive.db.QueryContext(ctx, `WITH first_in_chat AS (
-		SELECT message_id, chat_id, chat_mode, created_at, peer_id, content, state, retry_at,
-			ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY created_at, message_id) AS position
-		FROM archive_messages WHERE source = ? AND state != 'sent'
+		SELECT source, message_id, chat_id, chat_mode, created_at, peer_id, content, state, retry_at,
+			ROW_NUMBER() OVER (PARTITION BY source, chat_id ORDER BY created_at, message_id) AS position
+		FROM archive_messages WHERE source IN (?, ?) AND state != 'sent'
 	)
-	SELECT message_id, chat_id, chat_mode, created_at, peer_id, content, state
-	FROM first_in_chat WHERE position = 1 AND retry_at <= ? ORDER BY created_at, message_id`, source, time.Now().UnixMilli())
+	SELECT source, message_id, chat_id, chat_mode, created_at, peer_id, content, state
+	FROM first_in_chat WHERE position = 1 AND retry_at <= ? ORDER BY created_at, message_id`,
+		identity.source, identity.legacySource, time.Now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		item := archiveDelivery{source: source}
+		var item archiveDelivery
 		var mode string
-		if err := rows.Scan(&item.messageID, &item.chatID, &mode, &item.createdAt, &item.peerID, &item.content, &item.state); err != nil {
+		if err := rows.Scan(&item.source, &item.messageID, &item.chatID, &mode, &item.createdAt, &item.peerID, &item.content, &item.state); err != nil {
 			return nil, err
 		}
+		item.legacy = item.source == identity.legacySource
 		if archive.includes(chat{id: item.chatID, mode: mode}) {
 			return &item, nil
 		}
