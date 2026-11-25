@@ -1,0 +1,6 @@
+{
+  "endpoint": "https://api.vikingdb.cn-beijing.volces.com/openviking",
+  "api_key": "your_openviking_api_key",
+  "agent_id": "",
+  "group_ids": []
+}
