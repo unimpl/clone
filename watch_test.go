@@ -37,7 +37,7 @@ func TestWatchRoundPrioritizesAndCachesPreferences(t *testing.T) {
 		case "/open-apis/im/v1/chats/batch_query":
 			detailCalls++
 			checkWatchChatIDs(t, request, []string{"oc_pinned", "oc_muted"})
-			return jsonResponse(`{"code":0,"data":{"items":[{"chat_id":"oc_pinned","chat_mode":"p2p"},{"chat_id":"oc_muted","chat_mode":"p2p"}]}}`), nil
+			return jsonResponse(`{"code":0,"data":{"items":[{"chat_id":"oc_pinned","chat_mode":"group","external":true},{"chat_id":"oc_muted","chat_mode":"p2p"}]}}`), nil
 		case "/open-apis/im/v1/chat_user_setting/batch_get_mute_status":
 			muteCalls++
 			switch muteCalls {
@@ -84,6 +84,9 @@ func TestWatchRoundPrioritizesAndCachesPreferences(t *testing.T) {
 		if err := schedule.pollRound(context.Background(), client); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if pinned := schedule.preferences.pinned; len(pinned) == 0 || pinned[0].label() != "外部群聊" {
+		t.Fatalf("pinned chat lost its external group label: %v", pinned)
 	}
 	want := []string{"oc_muted", "oc_pinned", "oc_hot", "oc_background", "oc_muted", "oc_pinned", "oc_hot", "oc_background"}
 	if len(messages) == len(want) {

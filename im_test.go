@@ -32,7 +32,7 @@ func TestIMUsesUserIdentityAndPaginates(t *testing.T) {
 			if query.Get("types") != "p2p,group" {
 				t.Fatalf("p2p conversations missing from request: %v", query)
 			}
-			body = `{"code":0,"data":{"items":[{"chat_id":"oc_dm","chat_mode":"p2p"},{"chat_id":"oc_group","chat_mode":"group"}]}}`
+			body = `{"code":0,"data":{"items":[{"chat_id":"oc_dm","chat_mode":"p2p"},{"chat_id":"oc_group","chat_mode":"group"},{"chat_id":"oc_external","chat_mode":"group","external":true}]}}`
 		case "/open-apis/im/v1/messages":
 			if query.Get("container_id") != "oc_dm" || query.Get("start_time") != "10" {
 				t.Fatalf("unexpected message query: %v", query)
@@ -53,7 +53,7 @@ func TestIMUsesUserIdentityAndPaginates(t *testing.T) {
 	client.token = "user-token"
 	ctx := context.Background()
 	chats, err := client.chats(ctx)
-	if err != nil || len(chats) != 2 || chats[0].label() != "私聊" || chats[1].label() != "群聊" {
+	if err != nil || len(chats) != 3 || chats[0].label() != "私聊" || chats[1].label() != "群聊" || chats[2].label() != "外部群聊" {
 		t.Fatalf("chats = %v, error = %v", chats, err)
 	}
 	messages, err := client.messages(ctx, "chat", chats[0].id, time.UnixMilli(10500), time.Unix(12, 0))
@@ -92,6 +92,7 @@ func TestWatchSkipsHistoryAndDuplicates(t *testing.T) {
 
 func TestWatchPreview(t *testing.T) {
 	const imageURL = "https://open.feishu.cn/open-apis/im/v1/messages/om_example/resources/img_v3_example?type=image"
+	const fileURL = "https://open.feishu.cn/open-apis/im/v1/messages/om_example/resources/file_v2_example?type=file"
 	const sourceURL = "https://applink.feishu.cn/client/chat/open?openChatId=oc_example"
 	tests := []struct {
 		name string
@@ -120,15 +121,49 @@ func TestWatchPreview(t *testing.T) {
 			want: "[图片] | 图片资源 API " + imageURL + " | 飞书原消息 " + sourceURL,
 		},
 		{
+			name: "file name and resource links",
+			kind: "file",
+			body: `{"file_name":"版本说明.pdf","file_key":"file_v2_example"}`,
+			link: sourceURL,
+			want: "[文件] 版本说明.pdf | 文件资源 API " + fileURL + " | 飞书原消息 " + sourceURL,
+		},
+		{
+			name: "file with optional size and MIME type",
+			kind: "file",
+			body: `{"file_name":"版本说明.pdf","file_key":"file_v2_example","file_size":"1024","mime_type":"application/pdf"}`,
+			want: "[文件] 版本说明.pdf 1024 字节 application/pdf | 文件资源 API " + fileURL,
+		},
+		{
 			name: "image address survives shortened body",
 			kind: "post",
 			body: `{"title":"` + strings.Repeat("字", 205) + `","content":[[{"tag":"img","image_key":"img_v3_example"}]]}`,
 			want: strings.Repeat("字", 200) + "… | 图片资源 API " + imageURL,
 		},
+		{
+			name: "pin notice without an actor",
+			kind: "system",
+			body: `{"template":"{name} clipped content to top.","from_user":[],"to_chatters":[],"divider_text":{}}`,
+			want: "有人置顶了一条消息",
+		},
+		{
+			name: "invitation notice",
+			kind: "system",
+			body: `{"template":"{from_user} invited {to_chatters} to this chat.","from_user":["小林"],"to_chatters":["小张","小王"]}`,
+			want: "小林 invited 小张、小王 to this chat.",
+		},
+		{
+			name: "localized divider notice",
+			kind: "system",
+			body: `{"template":"{divider_text}","divider_text":{"text":"New Session","i18n_text":{"zh_cn":"新话题"}}}`,
+			want: "新话题",
+		},
+		{name: "system payload without template", kind: "system", body: `{"action":"other"}`, want: `[系统消息] {"action":"other"}`},
+		{name: "empty system payload", kind: "system", body: `{}`, want: "[系统消息]"},
 		{name: "invalid post", kind: "post", body: "{", want: "[post]"},
 		{name: "missing image key", kind: "image", body: `{}`, want: "[图片]"},
 		{name: "plain text mention", kind: "text", body: `{"text":"你好 @_user_1"}`, want: "你好 @小林"},
-		{name: "unsupported type", kind: "file", body: `{}`, want: "[file]"},
+		{name: "missing file fields", kind: "file", body: `{}`, want: "[文件]"},
+		{name: "unsupported type", kind: "sticker", body: `{}`, want: "[sticker]"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -140,8 +175,12 @@ func TestWatchPreview(t *testing.T) {
 			raw.MsgType = &test.kind
 			raw.Body = &larkim.MessageBody{Content: &test.body}
 			raw.MessageAppLink = &test.link
-			if got := preview(message{id: get(raw.MessageId), raw: &raw}); got != test.want {
+			m := message{id: get(raw.MessageId), raw: &raw}
+			if got := preview(m); got != test.want {
 				t.Errorf("preview = %q, want %q", got, test.want)
+			}
+			if test.kind == "system" && senderName(m) != "系统" {
+				t.Errorf("system sender = %q, want 系统", senderName(m))
 			}
 		})
 	}

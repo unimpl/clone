@@ -115,7 +115,7 @@ func makeArchiveMessage(c chat, m message, threadID string) archiveMessage {
 func archiveImageURLs(kind, id, body string) []string {
 	var urls []string
 	add := func(key string) {
-		if address := imageResourceURL(id, key); address != "" && !slices.Contains(urls, address) {
+		if address := messageResourceURL(id, key, "image"); address != "" && !slices.Contains(urls, address) {
 			urls = append(urls, address)
 		}
 	}

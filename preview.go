@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -33,6 +35,10 @@ func preview(m message) string {
 		}
 	case "post":
 		return m.previewPost(decodePost(body))
+	case "system":
+		return previewSystem(body)
+	case "file":
+		return m.previewFile(body)
 	case "image":
 		var content struct {
 			ImageKey string `json:"image_key"`
@@ -41,6 +47,99 @@ func preview(m message) string {
 		return m.previewWithLinks("[图片]", m.imageLink(content.ImageKey))
 	}
 	return "[" + kind + "]"
+}
+
+func (m message) previewFile(body []byte) string {
+	var file struct {
+		Name     string          `json:"file_name"`
+		Key      string          `json:"file_key"`
+		Size     json.RawMessage `json:"file_size"`
+		MIMEType string          `json:"mime_type"`
+	}
+	_ = json.Unmarshal(body, &file)
+
+	parts := []string{"[文件]"}
+	if name := terminalText(file.Name, 200); name != "" {
+		parts = append(parts, name)
+	}
+	if size, err := strconv.ParseInt(strings.Trim(string(file.Size), `"`), 10, 64); err == nil && size >= 0 {
+		parts = append(parts, strconv.FormatInt(size, 10)+" 字节")
+	}
+	if mimeType := terminalText(file.MIMEType, 80); mimeType != "" {
+		parts = append(parts, mimeType)
+	}
+	summary := strings.Join(parts, " ")
+	if address := messageResourceURL(m.id, file.Key, "file"); address != "" {
+		return m.previewWithLinks(summary, "文件资源 API "+address)
+	}
+	if key := terminalText(file.Key, 100); key != "" {
+		return m.previewWithLinks(summary, "文件标识 "+key)
+	}
+	return m.previewWithLinks(summary)
+}
+
+var systemPlaceholder = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
+
+func previewSystem(body []byte) string {
+	var fields map[string]any
+	if json.Unmarshal(body, &fields) == nil {
+		template := systemText(fields["template"])
+		actor := systemText(fields["name"])
+		if actor == "" {
+			actor = systemText(fields["from_user"])
+		}
+		if strings.EqualFold(template, "{name} clipped content to top.") {
+			if actor == "" {
+				actor = "有人"
+			}
+			template = actor + "置顶了一条消息"
+		} else {
+			template = systemPlaceholder.ReplaceAllStringFunc(template, func(placeholder string) string {
+				key := placeholder[1 : len(placeholder)-1]
+				if value := systemText(fields[key]); value != "" {
+					return value
+				}
+				if key == "name" && actor != "" {
+					return actor
+				}
+				return placeholder
+			})
+		}
+		for _, text := range []string{template, systemText(fields["text"]), systemText(fields["content"])} {
+			if text = terminalText(text, 300); text != "" {
+				return text
+			}
+		}
+	}
+	if text := terminalText(string(body), 300); text != "" && text != "{}" && text != "null" {
+		return "[系统消息] " + text
+	}
+	return "[系统消息]"
+}
+
+func systemText(value any) string {
+	switch value := value.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		var items []string
+		for _, item := range value {
+			if text := systemText(item); text != "" {
+				items = append(items, text)
+			}
+		}
+		return strings.Join(items, "、")
+	case map[string]any:
+		if translations, ok := value["i18n_text"].(map[string]any); ok {
+			if text, ok := translations["zh_cn"].(string); ok && strings.TrimSpace(text) != "" {
+				return strings.TrimSpace(text)
+			}
+		}
+		if text, ok := value["text"].(string); ok {
+			return strings.TrimSpace(text)
+		}
+	}
+	return ""
 }
 
 func (m message) replaceMentions(value string) string {
@@ -162,19 +261,19 @@ func (m message) postMention(node postNode) string {
 }
 
 func (m message) imageLink(key string) string {
-	address := imageResourceURL(m.id, key)
+	address := messageResourceURL(m.id, key, "image")
 	if address == "" {
 		return ""
 	}
 	return "图片资源 API " + address
 }
 
-func imageResourceURL(messageID, key string) string {
+func messageResourceURL(messageID, key, kind string) string {
 	if messageID == "" || key == "" {
 		return ""
 	}
 	return imBaseURL + "/open-apis/im/v1/messages/" +
-		url.PathEscape(messageID) + "/resources/" + url.PathEscape(key) + "?type=image"
+		url.PathEscape(messageID) + "/resources/" + url.PathEscape(key) + "?type=" + url.QueryEscape(kind)
 }
 
 func (m message) previewWithLinks(summary string, links ...string) string {

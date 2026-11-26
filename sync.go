@@ -447,6 +447,9 @@ func senderName(m message) string {
 			}
 		}
 	}
+	if get(m.raw.MsgType) == "system" {
+		return "系统"
+	}
 	return "未知发送者"
 }
 

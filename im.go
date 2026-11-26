@@ -65,14 +65,18 @@ func (client *imClient) pauseAfterLimit(header http.Header, attempt int) {
 }
 
 type chat struct {
-	id   string
-	name string
-	mode string
+	id       string
+	name     string
+	mode     string
+	external bool
 }
 
 func (c chat) label() string {
 	if c.mode == "p2p" {
 		return "私聊"
+	}
+	if c.external {
+		return "外部群聊"
 	}
 	return "群聊"
 }
@@ -150,7 +154,7 @@ func chatFromListItem(item *larkim.ListChat) chat {
 	if name == "" {
 		name = id
 	}
-	return chat{id: id, name: name, mode: get(item.ChatMode)}
+	return chat{id: id, name: name, mode: get(item.ChatMode), external: get(item.External)}
 }
 
 type message struct {
